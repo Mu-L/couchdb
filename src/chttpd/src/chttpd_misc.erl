@@ -31,12 +31,14 @@
 
 -include_lib("couch/include/couch_db.hrl").
 -include_lib("couch_mrview/include/couch_mrview.hrl").
+-include_lib("couch_views/include/couch_views.hrl").
 
 -import(chttpd,
     [send_json/2,send_json/3,send_method_not_allowed/2,
     send_chunk/2,start_chunked_response/3]).
 
 -define(MAX_DB_NUM_FOR_DBS_INFO, 100).
+-define(ACTIVE_TASK_JOB_TYPES, [<<"views">>, <<"replication">>]).
 
 % httpd global handlers
 
@@ -294,11 +296,25 @@ dbs_info_callback({error, Reason}, #vacc{resp = Resp0} = Acc) ->
 
 handle_task_status_req(#httpd{method='GET'}=Req) ->
     ok = chttpd:verify_is_server_admin(Req),
-    {Replies, _BadNodes} = gen_server:multi_call(couch_task_status, all),
-    Response = lists:flatmap(fun({Node, Tasks}) ->
-        [{[{node,Node} | Task]} || Task <- Tasks]
-    end, Replies),
-    send_json(Req, lists:sort(Response));
+    Jobs = lists:foldl(fun(Type, JobsAcc) ->
+        NewJobs = couch_jobs_fdb:get_active_jobs(Type),
+        maps:merge(NewJobs, JobsAcc)
+    end, #{}, ?ACTIVE_TASK_JOB_TYPES),
+    ActiveTasks = maps:map(fun(JobId, _) ->
+        fabric2_fdb:transactional(fun(Tx) ->
+            lists:foldl(fun(Type, TasksAcc) ->
+                case couch_jobs:get_job_data(Tx, Type, JobId) of
+                    {ok, Data} ->
+                        NewTask = maps:get(<<"active_tasks_info">>,
+                            Data, #{}),
+                        maps:merge(NewTask, TasksAcc);
+                    {error, _} ->
+                        TasksAcc
+                end
+            end, #{}, ?ACTIVE_TASK_JOB_TYPES)
+        end)
+    end, Jobs),
+    send_json(Req, maps:values(ActiveTasks));
 handle_task_status_req(Req) ->
     send_method_not_allowed(Req, "GET,HEAD").
 

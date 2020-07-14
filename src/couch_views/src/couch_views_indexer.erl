@@ -90,6 +90,7 @@ init() ->
         job => Job,
         job_data => Data,
         count => 0,
+        changes_done => 0,
         limiter => Limiter,
         doc_acc => [],
         design_opts => Mrst#mrst.design_opts
@@ -191,7 +192,8 @@ do_update(Db, Mrst0, State0) ->
             last_seq := LastSeq,
             limit := Limit,
             limiter := Limiter,
-            view_vs := ViewVS
+            view_vs := ViewVS,
+            changes_done := ChangesDone0
         } = State2,
         DocAcc1 = fetch_docs(TxDb, DocAcc),
         couch_rate:in(Limiter, Count),
@@ -199,13 +201,16 @@ do_update(Db, Mrst0, State0) ->
         {Mrst1, MappedDocs} = map_docs(Mrst0, DocAcc1),
         WrittenDocs = write_docs(TxDb, Mrst1, MappedDocs, State2),
 
+        ChangesDone = ChangesDone0 + WrittenDocs,
+
         couch_rate:success(Limiter, WrittenDocs),
 
         case Count < Limit of
             true ->
                 maybe_set_build_status(TxDb, Mrst1, ViewVS,
                     ?INDEX_READY),
-                report_progress(State2, finished),
+                report_progress(State2#{changes_done := ChangesDone},
+                    finished),
                 {Mrst1, finished};
             false ->
                 State3 = report_progress(State2, update),
@@ -213,6 +218,7 @@ do_update(Db, Mrst0, State0) ->
                     tx_db := undefined,
                     count := 0,
                     doc_acc := [],
+                    changes_done := ChangesDone,
                     view_seq := LastSeq
                 }}
         end
@@ -483,7 +489,9 @@ report_progress(State, UpdateType) ->
         tx_db := TxDb,
         job := Job1,
         job_data := JobData,
-        last_seq := LastSeq
+        last_seq := LastSeq,
+        db_seq := DBSeq,
+        changes_done := ChangesDone0
     } = State,
 
     #{
@@ -491,8 +499,17 @@ report_progress(State, UpdateType) ->
         <<"db_uuid">> := DbUUID,
         <<"ddoc_id">> := DDocId,
         <<"sig">> := Sig,
-        <<"retries">> := Retries
+        <<"retries">> := Retries,
+        <<"active_tasks_info">> := ActiveTasks
     } = JobData,
+
+    ChangesDone1 = case maps:get(<<"changes_done">>, ActiveTasks, 0) of
+        0 -> 0;
+        N -> N
+    end,
+    TotalDone = ChangesDone0 + ChangesDone1,
+    NewActiveTasks = active_tasks_info(TotalDone, DbName, DDocId,
+        LastSeq, DBSeq),
 
     % Reconstruct from scratch to remove any
     % possible existing error state.
@@ -502,7 +519,8 @@ report_progress(State, UpdateType) ->
         <<"ddoc_id">> => DDocId,
         <<"sig">> => Sig,
         <<"view_seq">> => LastSeq,
-        <<"retries">> => Retries
+        <<"retries">> => Retries,
+        <<"active_tasks_info">> => NewActiveTasks
     },
 
     case UpdateType of
@@ -541,3 +559,35 @@ key_size_limit() ->
 
 value_size_limit() ->
     config:get_integer("couch_views", "value_size_limit", ?VALUE_SIZE_LIMIT).
+
+
+active_tasks_info(ChangesDone, DbName, DDocId, LastSeq, DBSeq) ->
+    VS = case LastSeq of
+        <<"0">> -> {versionstamp, 0, 0, 0};
+        undefined -> {versionstamp, 0, 0, 0};
+        _ -> fabric2_fdb:seq_to_vs(LastSeq)
+    end,
+    DbVS = case DBSeq of
+        undefined -> {versionstamp, 0, 0, 0};
+        _ ->fabric2_fdb:seq_to_vs(DBSeq)
+    end,
+    DbVS1 = convert_version_stamp(DbVS),
+    VS1 = convert_version_stamp(VS),
+    {[
+        {<<"type">>, <<"indexer">>},
+        {<<"indexer_pid">>, list_to_binary(pid_to_list(self()))},
+        {<<"database">>, DbName},
+        {<<"changes_done">>, ChangesDone},
+        {<<"design_document">>, DDocId},
+        {<<"current_version_stamp">>, VS1},
+        {<<"db_version_stamp">>, DbVS1}
+    ]}.
+
+
+convert_version_stamp({_, Stamp, Batch, DocNumber}) ->
+    VS = integer_to_list(Stamp) ++ "-" ++ integer_to_list(Batch)
+        ++ "-" ++ integer_to_list(DocNumber),
+    list_to_binary(VS);
+
+convert_version_stamp(_) ->
+    <<"N/A">>.
